@@ -37,7 +37,7 @@ fun SnakeMapScreen() {
     LaunchedEffect(paused) {
         while (true) {
             if (!paused && gpsIndex < route.coordinates.size - 1) {
-                delay(200)
+                delay(800)
                 gpsIndex++
                 routeState.eatUpTo(gpsIndex)
                 mapInstance?.let { drawSnakeRoute(it, routeState) }
