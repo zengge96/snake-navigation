@@ -33,7 +33,6 @@ fun SnakeMapScreen() {
     var mapViewInstance by remember { mutableStateOf<MapView?>(null) }
 
     val route = remember { SampleRoute.createSummerPalace() }
-    val routeState = remember { RouteState(route) }
     var gpsIndex by remember { mutableIntStateOf(0) }
     var paused by remember { mutableStateOf(false) }
 
@@ -41,17 +40,26 @@ fun SnakeMapScreen() {
     var editMode by remember { mutableStateOf(false) }
     var waypoints by remember { mutableStateOf<List<LatLng>>(emptyList()) }
 
+    // Active route (custom or default)
+    var customRoute by remember { mutableStateOf<ScenicRoute?>(null) }
+    fun currentRoute(): ScenicRoute = customRoute ?: route
+
+    // Force redraw trigger
+    var tick by remember { mutableIntStateOf(0) }
+
     val engine = remember { SnakeEngine() }
 
-    // GPS simulation
-    LaunchedEffect(paused, editMode) {
+    // GPS simulation (restarts on customRoute change)
+    LaunchedEffect(paused, editMode, customRoute, tick) {
         if (editMode) return@LaunchedEffect
+        val active = currentRoute()
+        gpsIndex = 0
+        mapInstance?.let { drawSnakeRoute(it, RouteState(active)) }
         while (true) {
-            if (!paused && gpsIndex < route.coordinates.size - 1) {
+            if (!paused && gpsIndex < active.coordinates.size - 1) {
                 delay(800)
                 gpsIndex++
-                routeState.eatUpTo(gpsIndex)
-                mapInstance?.let { drawSnakeRoute(it, routeState) }
+                mapInstance?.let { drawSnakeRoute(it, RouteState(active).also { it.eatUpTo(gpsIndex) }) }
             } else {
                 delay(100)
             }
@@ -69,10 +77,10 @@ fun SnakeMapScreen() {
                             mapInstance = map
                             map.moveCamera(
                                 CameraUpdateFactory.newLatLngZoom(
-                                    route.coordinates.first().toMaplibre(), 15.0
+                                    currentRoute().coordinates.first().toMaplibre(), 15.0
                                 )
                             )
-                            drawSnakeRoute(map, routeState)
+                            drawSnakeRoute(map, RouteState(currentRoute()).also { s -> (0..gpsIndex).forEach { s.eatUpTo(it) } })
 
                             // Map click → add waypoint in edit mode
                             map.addOnMapClickListener { point ->
@@ -131,17 +139,16 @@ fun SnakeMapScreen() {
             Button(
                 onClick = {
                     // Save waypoints as route
-                    val newRoute = ScenicRouteData(
-                        id = "custom",
+                    val scenicRoute = ScenicRoute(
+                        id = "custom-${System.currentTimeMillis()}",
                         name = "自定义路线 (${waypoints.size}个点)",
-                        coordinates = waypoints,
-                        waypointNames = waypoints.indices.map { "点${it + 1}" },
-                        isLoop = false
+                        coordinates = waypoints.toList(),
+                        totalDistanceKm = -1.0
                     )
+                    customRoute = scenicRoute
                     editMode = false
                     waypoints = emptyList()
                     redrawEditor(mapInstance, emptyList())
-                    // TODO: switch to new route
                 },
                 modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp)
             ) { Text("✅ 保存路线 (${waypoints.size}个点)") }
@@ -150,7 +157,8 @@ fun SnakeMapScreen() {
         // Progress + Play/Pause
         if (!editMode) {
             SnakeGauge(
-                progress = routeState.progress,
+                progress = if (currentRoute().coordinates.size <= 1) 1f
+                    else gpsIndex.toFloat() / (currentRoute().coordinates.size - 1).toFloat(),
                 modifier = Modifier.align(Alignment.TopEnd).padding(16.dp)
             )
 
@@ -159,7 +167,7 @@ fun SnakeMapScreen() {
                 modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
             ) { Text(if (paused) "▶ 继续" else "⏸ 暂停") }
 
-            if (routeState.isFullyEaten) {
+            if (gpsIndex >= currentRoute().coordinates.size - 1) {
                 Text("🎉 路线已吃完！",
                     modifier = Modifier.align(Alignment.Center).padding(32.dp))
             }
@@ -227,28 +235,37 @@ private fun drawSnakeRoute(map: MapLibreMap, state: RouteState) {
 // ===== Route Editor rendering =====
 private fun redrawEditor(map: MapLibreMap?, waypoints: List<LatLng>) {
     val style = map?.style ?: return
-    listOf("wp-line", "wp-marker").forEach { n ->
-        try { style.removeLayer(n) } catch (_: Exception) {} }
-    listOf("wp-source").forEach { n ->
-        try { style.removeSource(n) } catch (_: Exception) {} }
 
-    if (waypoints.isEmpty()) return
+    // Clean up ALL old markers and line
+    for (i in 0..50) {
+        try { style.removeLayer("wp-marker-$i") } catch (_: Exception) { break }
+    }
+    for (i in 0..50) {
+        try { style.removeSource("wp-source-$i") } catch (_: Exception) { break }
+    }
+    try { style.removeLayer("wp-line") } catch (_: Exception) {}
+    try { style.removeSource("wp-editor-source") } catch (_: Exception) {}
 
-    // Connecting line
-    style.addSource(GeoJsonSource("wp-source", geoJsonLineString(waypoints)))
-    style.addLayer(LineLayer("wp-line", "wp-source").apply {
-        setProperties(
-            PropertyFactory.lineColor(Color.parseColor("#FF9800")),
-            PropertyFactory.lineWidth(6f), PropertyFactory.lineOpacity(0.8f)
-        )
-    })
+    if (waypoints.size < 1) return
 
-    // Waypoint markers (numbered circles)
+    // Single GeoJSON source for the connecting line
+    if (waypoints.size >= 2) {
+        style.addSource(GeoJsonSource("wp-editor-source", geoJsonLineString(waypoints)))
+        style.addLayer(LineLayer("wp-line", "wp-editor-source").apply {
+            setProperties(
+                PropertyFactory.lineColor(Color.parseColor("#FF9800")),
+                PropertyFactory.lineWidth(6f), PropertyFactory.lineOpacity(0.8f)
+            )
+        })
+    }
+
+    // Individual waypoint circles
     waypoints.forEachIndexed { i, wp ->
-        val srcId = "wp-marker-$i"
-        try { style.addSource(GeoJsonSource(srcId, geoJsonPoint(wp.lat, wp.lng))) } catch (_: Exception) {}
+        val srcId = "wp-source-$i"
+        val layerId = "wp-marker-$i"
         try {
-            style.addLayer(CircleLayer("wp-marker-$i", srcId).apply {
+            style.addSource(GeoJsonSource(srcId, geoJsonPoint(wp.lat, wp.lng)))
+            style.addLayer(CircleLayer(layerId, srcId).apply {
                 setProperties(
                     PropertyFactory.circleColor(Color.parseColor("#FF5722")),
                     PropertyFactory.circleRadius(12f),
