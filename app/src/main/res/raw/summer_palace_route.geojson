@@ -1,0 +1,66 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "颐和园经典游览路线",
+        "description": "东宫门→仁寿殿→长廊→排云殿→石舫→西堤→南湖岛→十七孔桥→东宫门",
+        "distance_km": 3.5
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [116.2755, 39.9998],
+          [116.2750, 40.0008],
+          [116.2740, 40.0015],
+          [116.2725, 40.0025],
+          [116.2710, 40.0030],
+          [116.2690, 40.0025],
+          [116.2670, 40.0010],
+          [116.2660, 39.9985],
+          [116.2675, 39.9960],
+          [116.2690, 39.9940],
+          [116.2710, 39.9930],
+          [116.2730, 39.9935],
+          [116.2745, 39.9950],
+          [116.2755, 39.9975],
+          [116.2755, 39.9998]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "东宫门",
+        "type": "entrance"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [116.2755, 39.9998]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "排云殿",
+        "type": "scenic"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [116.2710, 40.0030]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "南湖岛",
+        "type": "scenic"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [116.2710, 39.9930]
+      }
+    }
+  ]
+}
