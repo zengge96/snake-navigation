@@ -54,11 +54,35 @@ fun SnakeMapScreen() {
         if (editMode) return@LaunchedEffect
         val active = currentRoute()
         gpsIndex = 0
+
+        // Build route graph for A* pathfinding
+        val routeData = ScenicRouteData(
+            id = active.id,
+            name = active.name,
+            coordinates = active.coordinates,
+            isLoop = false
+        )
+        val graph = engine.buildChainGraph(routeData)
+
         mapInstance?.let { drawSnakeRoute(it, RouteState(active)) }
         while (true) {
             if (!paused && gpsIndex < active.coordinates.size - 1) {
                 delay(800)
-                gpsIndex++
+                // A*: find next target avoiding eaten edges
+                val nextTarget = engine.findNextTarget(graph, gpsIndex)
+                if (nextTarget != null && nextTarget != gpsIndex) {
+                    // Follow path to target
+                    val path = engine.findPath(graph, gpsIndex, nextTarget)
+                    val nextStep = if (path != null && path.size > 1) path[1] else (gpsIndex + 1)
+                    // Mark edge as eaten
+                    graph.eatEdge(gpsIndex, nextStep)
+                    gpsIndex = nextStep
+                } else {
+                    gpsIndex++
+                    if (gpsIndex < graph.nodes.size) {
+                        graph.eatEdge(gpsIndex - 1, gpsIndex)
+                    }
+                }
                 mapInstance?.let { drawSnakeRoute(it, RouteState(active).also { it.eatUpTo(gpsIndex) }) }
             } else {
                 delay(100)
