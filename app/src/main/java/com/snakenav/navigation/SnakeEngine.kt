@@ -158,6 +158,13 @@ class SnakeEngine {
             val dist = RouteMatcher.haversine(coords[i], coords[i + 1]) / 1000.0
             edges.add(GraphEdge(i, i + 1, dist))
         }
+        // 额外分岔边
+        for ((from, to) in route.connections) {
+            if (from in coords.indices && to in coords.indices) {
+                val dist = RouteMatcher.haversine(coords[from], coords[to]) / 1000.0
+                edges.add(GraphEdge(from, to, dist))
+            }
+        }
         // 如果是环形路线，首尾相连
         if (route.isLoop && coords.size >= 3) {
             val dist = RouteMatcher.haversine(coords.last(), coords.first()) / 1000.0
@@ -190,5 +197,7 @@ data class ScenicRouteData(
     val name: String,
     val coordinates: List<LatLng>,
     val waypointNames: List<String> = emptyList(),
-    val isLoop: Boolean = false
+    val isLoop: Boolean = false,
+    /** 用户自定义的额外边（超出链式连接的部分），用于分岔路线 */
+    val connections: List<Pair<Int, Int>> = emptyList()
 )

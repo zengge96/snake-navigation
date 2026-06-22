@@ -39,6 +39,9 @@ fun SnakeMapScreen() {
     // Route editor state
     var editMode by remember { mutableStateOf(false) }
     var waypoints by remember { mutableStateOf<List<LatLng>>(emptyList()) }
+    var connections by remember { mutableStateOf<List<Pair<Int, Int>>>(emptyList()) }
+    var connectionMode by remember { mutableStateOf(false) }
+    var selectedWpIdx by remember { mutableIntStateOf(-1) }
 
     // Active route (custom or default)
     var customRoute by remember { mutableStateOf<ScenicRoute?>(null) }
@@ -106,12 +109,55 @@ fun SnakeMapScreen() {
                             )
                             drawSnakeRoute(map, RouteState(currentRoute()).also { s -> (0..gpsIndex).forEach { s.eatUpTo(it) } })
 
-                            // Map click → add waypoint in edit mode
+                            // Map click → add waypoint OR create connection
                             map.addOnMapClickListener { point ->
-                                if (editMode) {
+                                if (!editMode) return@addOnMapClickListener false
+                                val wp = LatLng(point.latitude, point.longitude)
+
+                                if (connectionMode && waypoints.isNotEmpty()) {
+                                    // Find nearest waypoint (screen distance)
+                                    val proj = map.projection
+                                    val tapScreen = proj.toScreenLocation(
+                                        org.maplibre.android.geometry.LatLng(point.latitude, point.longitude)
+                                    )
+                                    var nearestIdx = -1
+                                    var nearestDist = Float.MAX_VALUE
+                                    for ((i, wpt) in waypoints.withIndex()) {
+                                        val ws = proj.toScreenLocation(wpt.toMaplibre())
+                                        val dx = tapScreen.x - ws.x
+                                        val dy = tapScreen.y - ws.y
+                                        val d = kotlin.math.sqrt(dx * dx + dy * dy)
+                                        if (d < nearestDist) { nearestDist = d; nearestIdx = i }
+                                    }
+
+                                    if (nearestDist < 80f && nearestIdx >= 0) {
+                                        if (selectedWpIdx < 0) {
+                                            // First selection
+                                            selectedWpIdx = nearestIdx
+                                        } else if (nearestIdx == selectedWpIdx) {
+                                            // Deselect
+                                            selectedWpIdx = -1
+                                        } else if (nearestIdx != selectedWpIdx) {
+                                            // Create connection
+                                            val edge = if (selectedWpIdx < nearestIdx)
+                                                (selectedWpIdx to nearestIdx)
+                                            else (nearestIdx to selectedWpIdx)
+                                            if (edge !in connections) {
+                                                connections = connections + edge
+                                            }
+                                            selectedWpIdx = -1
+                                        }
+                                        redrawEditor(map, waypoints, connections, selectedWpIdx)
+                                        return@addOnMapClickListener true
+                                    }
+                                    // Tap not near any waypoint: add as new waypoint
+                                    waypoints = waypoints + wp
+                                    redrawEditor(map, waypoints, connections, selectedWpIdx)
+                                    true
+                                } else if (editMode) {
                                     val wp = LatLng(point.latitude, point.longitude)
                                     waypoints = waypoints + wp
-                                    redrawEditor(map, waypoints)
+                                    redrawEditor(map, waypoints, connections, selectedWpIdx)
                                     true
                                 } else false
                             }
@@ -142,7 +188,10 @@ fun SnakeMapScreen() {
             FilledTonalButton(
                 onClick = {
                     editMode = false
+                    connectionMode = false
+                    selectedWpIdx = -1
                     waypoints = emptyList()
+                    connections = emptyList()
                     redrawEditor(mapInstance, emptyList())
                 },
                 modifier = Modifier
@@ -158,6 +207,35 @@ fun SnakeMapScreen() {
             ) { Text("✏️ 编辑路线") }
         }
 
+        // Connection mode toggle (when editing with 2+ waypoints)
+        if (editMode && waypoints.size >= 2) {
+            FilledTonalButton(
+                onClick = {
+                    connectionMode = !connectionMode
+                    selectedWpIdx = -1
+                },
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = 72.dp, start = 16.dp)
+            ) {
+                Text(if (connectionMode) "连线中..." else "连线")
+            }
+            if (connectionMode && selectedWpIdx >= 0) {
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 120.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
+                ) {
+                    Text(
+                        "已选航点 ${selectedWpIdx + 1}，点击另一个航点创建连接",
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                }
+            }
+        }
+
         // Save button (when has waypoints)
         if (editMode && waypoints.size >= 2) {
             Button(
@@ -169,10 +247,15 @@ fun SnakeMapScreen() {
                         coordinates = waypoints.toList(),
                         totalDistanceKm = -1.0
                     )
+                    // Save connections for graph building
+                    val savedConnections = connections.toList()
                     customRoute = scenicRoute
                     editMode = false
+                    connectionMode = false
+                    selectedWpIdx = -1
                     waypoints = emptyList()
-                    redrawEditor(mapInstance, emptyList())
+                    connections = emptyList()
+                    redrawEditor(mapInstance, emptyList(), savedConnections)
                 },
                 modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp)
             ) { Text("✅ 保存路线 (${waypoints.size}个点)") }
@@ -257,22 +340,32 @@ private fun drawSnakeRoute(map: MapLibreMap, state: RouteState) {
 }
 
 // ===== Route Editor rendering =====
-private fun redrawEditor(map: MapLibreMap?, waypoints: List<LatLng>) {
+private fun redrawEditor(map: MapLibreMap?, waypoints: List<LatLng>,
+                          connections: List<Pair<Int, Int>> = emptyList(),
+                          selectedIdx: Int = -1) {
     val style = map?.style ?: return
 
-    // Clean up ALL old markers and line
+    // Clean up ALL old markers, line, connection layers
     for (i in 0..50) {
         try { style.removeLayer("wp-marker-$i") } catch (_: Exception) { break }
     }
     for (i in 0..50) {
         try { style.removeSource("wp-source-$i") } catch (_: Exception) { break }
     }
+    for (i in 0..50) {
+        try { style.removeLayer("wp-conn-line-$i") } catch (_: Exception) { break }
+    }
+    for (i in 0..50) {
+        try { style.removeSource("wp-conn-source-$i") } catch (_: Exception) { break }
+    }
     try { style.removeLayer("wp-line") } catch (_: Exception) {}
     try { style.removeSource("wp-editor-source") } catch (_: Exception) {}
+    try { style.removeLayer("wp-connections") } catch (_: Exception) {}
+    try { style.removeSource("wp-connections-source") } catch (_: Exception) {}
 
     if (waypoints.size < 1) return
 
-    // Single GeoJSON source for the connecting line
+    // Default chain line (orange)
     if (waypoints.size >= 2) {
         style.addSource(GeoJsonSource("wp-editor-source", geoJsonLineString(waypoints)))
         style.addLayer(LineLayer("wp-line", "wp-editor-source").apply {
@@ -283,16 +376,47 @@ private fun redrawEditor(map: MapLibreMap?, waypoints: List<LatLng>) {
         })
     }
 
+    // Custom connection lines (cyan/blue)
+    if (connections.isNotEmpty()) {
+        val connCoords = connections.mapNotNull { (a, b) ->
+            if (a in waypoints.indices && b in waypoints.indices)
+                listOf(waypoints[a], waypoints[b]) else null
+        }.flatten()
+        if (connCoords.size >= 2) {
+            style.addSource(GeoJsonSource("wp-connections-source", geoJsonLineString(connCoords)))
+            // This single line won't work for multiple disjoint edges - use individual lines instead
+        }
+        // Individual connection lines
+        connections.forEachIndexed { ci, (a, b) ->
+            if (a in waypoints.indices && b in waypoints.indices) {
+                val coords = listOf(waypoints[a], waypoints[b])
+                val srcId = "wp-conn-source-$ci"
+                val layerId = "wp-conn-line-$ci"
+                try {
+                    style.addSource(GeoJsonSource(srcId, geoJsonLineString(coords)))
+                    style.addLayer(LineLayer(layerId, srcId).apply {
+                        setProperties(
+                            PropertyFactory.lineColor(Color.parseColor("#00BCD4")),
+                            PropertyFactory.lineWidth(4f),
+                            PropertyFactory.lineOpacity(0.7f)
+                        )
+                    })
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
     // Individual waypoint circles
     waypoints.forEachIndexed { i, wp ->
         val srcId = "wp-source-$i"
         val layerId = "wp-marker-$i"
         try {
             style.addSource(GeoJsonSource(srcId, geoJsonPoint(wp.lat, wp.lng)))
+            val isSelected = i == selectedIdx
             style.addLayer(CircleLayer(layerId, srcId).apply {
                 setProperties(
-                    PropertyFactory.circleColor(Color.parseColor("#FF5722")),
-                    PropertyFactory.circleRadius(12f),
+                    PropertyFactory.circleColor(if (isSelected) Color.parseColor("#FFEB3B") else Color.parseColor("#FF5722")),
+                    PropertyFactory.circleRadius(if (isSelected) 16f else 12f),
                     PropertyFactory.circleStrokeColor(Color.WHITE),
                     PropertyFactory.circleStrokeWidth(3f)
                 )
