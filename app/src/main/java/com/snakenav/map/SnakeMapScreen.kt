@@ -14,17 +14,22 @@ import com.snakenav.data.*
 import com.snakenav.gamification.SnakeGauge
 import com.snakenav.navigation.ScenicRouteData
 import com.snakenav.navigation.SnakeEngine
+import com.snakenav.navigation.RoadNetwork
+import com.snakenav.navigation.RoadNetworkLoader
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.MapLibreMap
-import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.LineLayer
 import org.maplibre.android.style.layers.CircleLayer
-import org.maplibre.android.style.layers.SymbolLayer
 import org.maplibre.android.style.layers.PropertyFactory
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng as MLatLng
+
+private enum class NavMode { SET_START, ADD_POINTS, NAVIGATING, DONE }
 
 @Composable
 fun SnakeMapScreen() {
@@ -32,67 +37,177 @@ fun SnakeMapScreen() {
     var mapInstance by remember { mutableStateOf<MapLibreMap?>(null) }
     var mapViewInstance by remember { mutableStateOf<MapView?>(null) }
 
-    val route = remember { SampleRoute.createSummerPalace() }
+    var navMode by remember { mutableStateOf(NavMode.SET_START) }
+    var startPoint by remember { mutableStateOf<LatLng?>(null) }
+    var startNodeId by remember { mutableIntStateOf(-1) }
+    var visitPoints by remember { mutableStateOf<List<LatLng>>(emptyList()) }
+    var visitNodeIds by remember { mutableStateOf<List<Int>>(emptyList()) }
+
+    var plannedRoute by remember { mutableStateOf<ScenicRoute?>(null) }
+    var routeNodePath by remember { mutableStateOf<List<Int>>(emptyList()) }
+    var calculating by remember { mutableStateOf(false) }
     var gpsIndex by remember { mutableIntStateOf(0) }
     var paused by remember { mutableStateOf(false) }
 
-    // Route editor state
-    var editMode by remember { mutableStateOf(false) }
-    var waypoints by remember { mutableStateOf<List<LatLng>>(emptyList()) }
-    var connections by remember { mutableStateOf<List<Pair<Int, Int>>>(emptyList()) }
-    var connectionMode by remember { mutableStateOf(false) }
-    var selectedWpIdx by remember { mutableIntStateOf(-1) }
-
-    // Active route (custom or default)
-    var customRoute by remember { mutableStateOf<ScenicRoute?>(null) }
-    fun currentRoute(): ScenicRoute = customRoute ?: route
-
-    // Force redraw trigger
-    var tick by remember { mutableIntStateOf(0) }
-
+    val roadNetwork = remember { RoadNetworkLoader.load(context) }
     val engine = remember { SnakeEngine() }
+    val scope = rememberCoroutineScope()
 
-    // GPS simulation (restarts on customRoute change)
-    LaunchedEffect(paused, editMode, customRoute, tick) {
-        if (editMode) return@LaunchedEffect
-        val active = currentRoute()
-        gpsIndex = 0
+    fun currentRoute(): ScenicRoute = plannedRoute
+        ?: SampleRoute.createSummerPalace()
 
-        // Build route graph for A* pathfinding
+    // ===== 地图点击 =====
+    fun onMapTap(lat: Double, lng: Double) {
+        when (navMode) {
+            NavMode.SET_START -> {
+                startPoint = LatLng(lat, lng)
+                startNodeId = roadNetwork.nearest(lat, lng)
+                navMode = NavMode.ADD_POINTS
+                redrawMarkers(mapInstance, startPoint, visitPoints)
+            }
+            NavMode.ADD_POINTS -> {
+                visitPoints = visitPoints + LatLng(lat, lng)
+                visitNodeIds = visitNodeIds + roadNetwork.nearest(lat, lng)
+                redrawMarkers(mapInstance, startPoint, visitPoints)
+            }
+            else -> {}
+        }
+    }
+
+    // ===== TSP 最优路径规划 =====
+    fun planOptimalRoute() {
+        if (startNodeId < 0) return
+        calculating = true
+        scope.launch {
+            val result = withContext(Dispatchers.Default) {
+                val allNodes = listOf(startNodeId) + visitNodeIds
+                val n = allNodes.size
+                if (n < 2) return@withContext emptyList<Int>()
+
+                // 1) 预计算所有点对之间的 A* 路径与距离
+                val pairCache = mutableMapOf<Pair<Int, Int>, Pair<List<Int>, Double>>()
+                for (i in 0 until n) {
+                    for (j in i + 1 until n) {
+                        val path = roadNetwork.findPath(allNodes[i], allNodes[j])
+                        if (path != null) {
+                            var dist = 0.0
+                            for (pi in 0 until path.size - 1) {
+                                dist += roadNetwork.distMeters(path[pi], path[pi + 1])
+                            }
+                            pairCache[allNodes[i] to allNodes[j]] = path to dist
+                            pairCache[allNodes[j] to allNodes[i]] = path.reversed() to dist
+                        }
+                    }
+                }
+
+                // 2) TSP: 找遍历所有途经点的最短路径
+                val waypointIndices = (1 until n).toList()
+                if (waypointIndices.isEmpty()) return@withContext emptyList<Int>()
+
+                var bestOrder = waypointIndices
+                var bestCost = Double.MAX_VALUE
+
+                // ≤7 个途经点 => 全排列穷举
+                if (waypointIndices.size <= 7) {
+                    for (perm in permutations(waypointIndices)) {
+                        var cost = 0.0
+                        var prev = 0
+                        for (wpIdx in perm) {
+                            val cached = pairCache[allNodes[prev] to allNodes[wpIdx]] ?: break
+                            cost += cached.second
+                            prev = wpIdx
+                        }
+                        if (cost < bestCost) { bestCost = cost; bestOrder = perm }
+                    }
+                } else {
+                    // >7 => 贪心最近邻
+                    val remaining = waypointIndices.toMutableList()
+                    var prev = 0
+                    while (remaining.isNotEmpty()) {
+                        var bestNext = remaining[0]
+                        var bestNextCost = Double.MAX_VALUE
+                        for (ri in remaining) {
+                            val c = pairCache[allNodes[prev] to allNodes[ri]]?.second
+                                ?: Double.MAX_VALUE
+                            if (c < bestNextCost) { bestNextCost = c; bestNext = ri }
+                        }
+                        remaining.remove(bestNext)
+                        prev = bestNext
+                    }
+                }
+
+                // 3) 按最优顺序拼接路径
+                val merged = mutableListOf<Int>()
+                var prev = 0
+                for (wpIdx in bestOrder) {
+                    val cached = pairCache[allNodes[prev] to allNodes[wpIdx]] ?: continue
+                    val seg = cached.first
+                    merged.addAll(if (merged.isEmpty()) seg else seg.drop(1))
+                    prev = wpIdx
+                }
+                merged
+            }
+
+            calculating = false
+            if (result.isEmpty()) return@launch
+
+            routeNodePath = result
+            val coords = result.map { id ->
+                val n = roadNetwork.nodes[id]; LatLng(n.lat, n.lng)
+            }
+            plannedRoute = ScenicRoute(
+                id = "nav-${System.currentTimeMillis()}",
+                name = "导航路线 (${result.size}段)",
+                coordinates = coords, totalDistanceKm = -1.0
+            )
+            gpsIndex = 0
+            paused = false
+            navMode = NavMode.NAVIGATING
+        }
+    }
+
+    // ===== 模拟循环 =====
+    LaunchedEffect(plannedRoute, paused, navMode) {
+        val route = plannedRoute ?: return@LaunchedEffect
+        if (navMode != NavMode.NAVIGATING) return@LaunchedEffect
+        if (route.coordinates.size < 2) return@LaunchedEffect
+
         val routeData = ScenicRouteData(
-            id = active.id,
-            name = active.name,
-            coordinates = active.coordinates,
-            isLoop = false
+            id = route.id, name = route.name,
+            coordinates = route.coordinates, isLoop = false
         )
         val graph = engine.buildChainGraph(routeData)
+        gpsIndex = 0
+        mapInstance?.let { drawSnakeRoute(it, RouteState(route)) }
 
-        mapInstance?.let { drawSnakeRoute(it, RouteState(active)) }
-        while (true) {
-            if (!paused && gpsIndex < active.coordinates.size - 1) {
+        while (navMode == NavMode.NAVIGATING && gpsIndex < route.coordinates.size - 1) {
+            if (!paused) {
                 delay(800)
-                // A*: find next target avoiding eaten edges
                 val nextTarget = engine.findNextTarget(graph, gpsIndex)
                 if (nextTarget != null && nextTarget != gpsIndex) {
-                    // Follow path to target
                     val path = engine.findPath(graph, gpsIndex, nextTarget)
                     val nextStep = if (path != null && path.size > 1) path[1] else (gpsIndex + 1)
-                    // Mark edge as eaten
                     graph.eatEdge(gpsIndex, nextStep)
                     gpsIndex = nextStep
+                    if (nextStep < routeNodePath.size)
+                        roadNetwork.markEaten(routeNodePath[nextStep])
                 } else {
                     gpsIndex++
                     if (gpsIndex < graph.nodes.size) {
                         graph.eatEdge(gpsIndex - 1, gpsIndex)
+                        if (gpsIndex < routeNodePath.size)
+                            roadNetwork.markEaten(routeNodePath[gpsIndex])
                     }
                 }
-                mapInstance?.let { drawSnakeRoute(it, RouteState(active).also { it.eatUpTo(gpsIndex) }) }
-            } else {
-                delay(100)
-            }
+                mapInstance?.let {
+                    drawSnakeRoute(it, RouteState(route).also { s -> s.eatUpTo(gpsIndex) })
+                }
+            } else delay(100)
         }
+        if (gpsIndex >= route.coordinates.size - 1) navMode = NavMode.DONE
     }
 
+    // ===== UI =====
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -103,63 +218,13 @@ fun SnakeMapScreen() {
                         map.setStyle("https://tiles.openfreemap.org/styles/liberty") {
                             mapInstance = map
                             map.moveCamera(
-                                CameraUpdateFactory.newLatLngZoom(
-                                    currentRoute().coordinates.first().toMaplibre(), 15.0
-                                )
+                                CameraUpdateFactory.newLatLngZoom(MLatLng(40.0, 116.275), 15.0)
                             )
-                            drawSnakeRoute(map, RouteState(currentRoute()).also { s -> (0..gpsIndex).forEach { s.eatUpTo(it) } })
-
-                            // Map click → add waypoint OR create connection
                             map.addOnMapClickListener { point ->
-                                if (!editMode) return@addOnMapClickListener false
-                                val wp = LatLng(point.latitude, point.longitude)
-
-                                if (connectionMode && waypoints.isNotEmpty()) {
-                                    // Find nearest waypoint (screen distance)
-                                    val proj = map.projection
-                                    val tapScreen = proj.toScreenLocation(
-                                        org.maplibre.android.geometry.LatLng(point.latitude, point.longitude)
-                                    )
-                                    var nearestIdx = -1
-                                    var nearestDist = Float.MAX_VALUE
-                                    for ((i, wpt) in waypoints.withIndex()) {
-                                        val ws = proj.toScreenLocation(wpt.toMaplibre())
-                                        val dx = tapScreen.x - ws.x
-                                        val dy = tapScreen.y - ws.y
-                                        val d = kotlin.math.sqrt(dx * dx + dy * dy)
-                                        if (d < nearestDist) { nearestDist = d; nearestIdx = i }
-                                    }
-
-                                    if (nearestDist < 80f && nearestIdx >= 0) {
-                                        if (selectedWpIdx < 0) {
-                                            // First selection
-                                            selectedWpIdx = nearestIdx
-                                        } else if (nearestIdx == selectedWpIdx) {
-                                            // Deselect
-                                            selectedWpIdx = -1
-                                        } else if (nearestIdx != selectedWpIdx) {
-                                            // Create connection
-                                            val edge = if (selectedWpIdx < nearestIdx)
-                                                (selectedWpIdx to nearestIdx)
-                                            else (nearestIdx to selectedWpIdx)
-                                            if (edge !in connections) {
-                                                connections = connections + edge
-                                            }
-                                            selectedWpIdx = -1
-                                        }
-                                        redrawEditor(map, waypoints, connections, selectedWpIdx)
-                                        return@addOnMapClickListener true
-                                    }
-                                    // Tap not near any waypoint: add as new waypoint
-                                    waypoints = waypoints + wp
-                                    redrawEditor(map, waypoints, connections, selectedWpIdx)
-                                    true
-                                } else if (editMode) {
-                                    val wp = LatLng(point.latitude, point.longitude)
-                                    waypoints = waypoints + wp
-                                    redrawEditor(map, waypoints, connections, selectedWpIdx)
-                                    true
-                                } else false
+                                if (navMode == NavMode.NAVIGATING || navMode == NavMode.DONE)
+                                    return@addOnMapClickListener false
+                                onMapTap(point.latitude, point.longitude)
+                                true
                             }
                         }
                     }
@@ -167,137 +232,105 @@ fun SnakeMapScreen() {
             }
         )
 
-        // Edit mode instructions
-        if (editMode) {
-            Surface(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 48.dp),
-                shape = RoundedCornerShape(12.dp),
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
-            ) {
-                Text(
-                    "📍 点击地图添加航点，已添加 ${waypoints.size} 个点",
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                )
-            }
+        // 顶部提示
+        val hint = when (navMode) {
+            NavMode.SET_START -> "点击地图设置起点"
+            NavMode.ADD_POINTS -> "继续点击添加途经点 (${visitPoints.size}个)，点底部规划路线"
+            NavMode.NAVIGATING -> "导航中... ${gpsIndex}/${currentRoute().coordinates.size}"
+            NavMode.DONE -> "全部吃完!"
         }
+        Surface(
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = 48.dp),
+            shape = RoundedCornerShape(12.dp),
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
+        ) { Text(hint, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) }
 
-        // Edit/Cancel button (top-right, below gauge)
-        if (editMode) {
-            FilledTonalButton(
-                onClick = {
-                    editMode = false
-                    connectionMode = false
-                    selectedWpIdx = -1
-                    waypoints = emptyList()
-                    connections = emptyList()
-                    redrawEditor(mapInstance, emptyList())
-                },
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 72.dp, end = 16.dp)
-            ) { Text("取消") }
-        } else {
-            FilledTonalButton(
-                onClick = { editMode = true },
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 72.dp, end = 16.dp)
-            ) { Text("✏️ 编辑路线") }
-        }
-
-        // Connection mode toggle (when editing with 2+ waypoints)
-        if (editMode && waypoints.size >= 2) {
-            FilledTonalButton(
-                onClick = {
-                    connectionMode = !connectionMode
-                    selectedWpIdx = -1
-                },
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(top = 72.dp, start = 16.dp)
-            ) {
-                Text(if (connectionMode) "连线中..." else "连线")
-            }
-            if (connectionMode && selectedWpIdx >= 0) {
-                Surface(
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = 120.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
-                ) {
-                    Text(
-                        "已选航点 ${selectedWpIdx + 1}，点击另一个航点创建连接",
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                    )
+        when (navMode) {
+            NavMode.ADD_POINTS -> {
+                if (visitPoints.isNotEmpty()) {
+                    Button(
+                        onClick = { planOptimalRoute() },
+                        modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp)
+                    ) { Text("规划路线 (${visitPoints.size}个点)") }
                 }
+                FilledTonalButton(
+                    onClick = {
+                        startPoint = null; startNodeId = -1; visitPoints = emptyList()
+                        visitNodeIds = emptyList(); plannedRoute = null; navMode = NavMode.SET_START
+                        mapInstance?.let { clearAllLayers(it) }
+                    },
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp)
+                ) { Text("重置") }
             }
-        }
-
-        // Save button (when has waypoints)
-        if (editMode && waypoints.size >= 2) {
-            Button(
-                onClick = {
-                    // Save waypoints as route
-                    val scenicRoute = ScenicRoute(
-                        id = "custom-${System.currentTimeMillis()}",
-                        name = "自定义路线 (${waypoints.size}个点)",
-                        coordinates = waypoints.toList(),
-                        totalDistanceKm = -1.0
-                    )
-                    // Save connections for graph building
-                    val savedConnections = connections.toList()
-                    customRoute = scenicRoute
-                    editMode = false
-                    connectionMode = false
-                    selectedWpIdx = -1
-                    waypoints = emptyList()
-                    connections = emptyList()
-                    redrawEditor(mapInstance, emptyList(), savedConnections)
-                },
-                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp)
-            ) { Text("✅ 保存路线 (${waypoints.size}个点)") }
-        }
-
-        // Progress + Play/Pause
-        if (!editMode) {
-            SnakeGauge(
-                progress = if (currentRoute().coordinates.size <= 1) 1f
-                    else gpsIndex.toFloat() / (currentRoute().coordinates.size - 1).toFloat(),
-                modifier = Modifier.align(Alignment.TopEnd).padding(16.dp)
-            )
-
-            FilledTonalButton(
-                onClick = { paused = !paused },
-                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
-            ) { Text(if (paused) "▶ 继续" else "⏸ 暂停") }
-
-            if (gpsIndex >= currentRoute().coordinates.size - 1) {
-                Text("🎉 路线已吃完！",
+            NavMode.NAVIGATING -> {
+                SnakeGauge(
+                    progress = if (currentRoute().coordinates.size <= 1) 1f
+                        else gpsIndex.toFloat() / (currentRoute().coordinates.size - 1).toFloat(),
+                    modifier = Modifier.align(Alignment.TopEnd).padding(16.dp)
+                )
+                FilledTonalButton(
+                    onClick = { paused = !paused },
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
+                ) { Text(if (paused) "继续" else "暂停") }
+                FilledTonalButton(
+                    onClick = {
+                        startPoint = null; startNodeId = -1; visitPoints = emptyList()
+                        visitNodeIds = emptyList(); plannedRoute = null; navMode = NavMode.SET_START
+                        mapInstance?.let { clearAllLayers(it) }
+                    },
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp)
+                ) { Text("重新开始") }
+            }
+            NavMode.DONE -> {
+                SnakeGauge(progress = 1f,
+                    modifier = Modifier.align(Alignment.TopEnd).padding(16.dp))
+                Text("全部吃完!",
                     modifier = Modifier.align(Alignment.Center).padding(32.dp))
+                FilledTonalButton(
+                    onClick = {
+                        startPoint = null; startNodeId = -1; visitPoints = emptyList()
+                        visitNodeIds = emptyList(); plannedRoute = null; navMode = NavMode.SET_START
+                        mapInstance?.let { clearAllLayers(it) }
+                    },
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp)
+                ) { Text("重新开始") }
             }
+            else -> {}
+        }
+
+        if (calculating) {
+            Surface(
+                modifier = Modifier.align(Alignment.Center).padding(32.dp),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
+            ) { Text("正在计算最优路线...",
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp)) }
         }
     }
 }
 
-// ===== GeoJSON helpers =====
+// ===== 全排列生成器 =====
+private fun permutations(list: List<Int>): Sequence<List<Int>> = sequence {
+    if (list.size <= 1) { yield(list); return@sequence }
+    for (i in list.indices) {
+        val elem = list[i]
+        val rest = list.filterIndexed { idx, _ -> idx != i }
+        for (perm in permutations(rest)) {
+            yield(listOf(elem) + perm)
+        }
+    }
+}
+
+// ===== GeoJSON =====
 private fun geoJsonLineString(coords: List<LatLng>): String {
-    val pts = coords.joinToString(",") { "[${it.lng},${it.lat}]" }
+    val pts = coords.joinToString { "[${it.lng},${it.lat}]" }
     return """{"type":"LineString","coordinates":[$pts]}"""
 }
 private fun geoJsonPoint(lat: Double, lng: Double): String {
     return """{"type":"Point","coordinates":[$lng,$lat]}"""
 }
-private fun geoJsonMultiPoint(coords: List<LatLng>): String {
-    val pts = coords.joinToString(",") { "[${it.lng},${it.lat}]" }
-    return """{"type":"GeometryCollection","geometries":[${coords.mapIndexed { i, c ->
-        """{"type":"Point","coordinates":[${c.lng},${c.lat}]}"""
-    }.joinToString(",")}]}"""
-}
 
-// ===== Route rendering =====
+// ===== 路线渲染 =====
 private fun drawSnakeRoute(map: MapLibreMap, state: RouteState) {
     val style = map.style ?: return
     listOf("eaten-line", "remaining-line", "snake-head").forEach { n ->
@@ -311,7 +344,8 @@ private fun drawSnakeRoute(map: MapLibreMap, state: RouteState) {
             setProperties(
                 PropertyFactory.lineColor(Color.parseColor("#777777")),
                 PropertyFactory.lineWidth(5f),
-                PropertyFactory.lineDasharray(Expression.raw("[\"literal\", [2.0, 4.0]]")),
+                PropertyFactory.lineDasharray(
+                    org.maplibre.android.style.expressions.Expression.raw("[\"literal\", [2.0, 4.0]]")),
                 PropertyFactory.lineOpacity(0.4f)
             )
         })
@@ -339,88 +373,45 @@ private fun drawSnakeRoute(map: MapLibreMap, state: RouteState) {
     }
 }
 
-// ===== Route Editor rendering =====
-private fun redrawEditor(map: MapLibreMap?, waypoints: List<LatLng>,
-                          connections: List<Pair<Int, Int>> = emptyList(),
-                          selectedIdx: Int = -1) {
+// ===== 标记渲染 =====
+private fun redrawMarkers(map: MapLibreMap?, start: LatLng?, visits: List<LatLng>) {
     val style = map?.style ?: return
+    listOf("start-marker", "visit-markers").forEach { n ->
+        try { style.removeLayer(n) } catch (_: Exception) {} }
+    listOf("start-source", "visit-source").forEach { n ->
+        try { style.removeSource(n) } catch (_: Exception) {} }
 
-    // Clean up ALL old markers, line, connection layers
-    for (i in 0..50) {
-        try { style.removeLayer("wp-marker-$i") } catch (_: Exception) { break }
-    }
-    for (i in 0..50) {
-        try { style.removeSource("wp-source-$i") } catch (_: Exception) { break }
-    }
-    for (i in 0..50) {
-        try { style.removeLayer("wp-conn-line-$i") } catch (_: Exception) { break }
-    }
-    for (i in 0..50) {
-        try { style.removeSource("wp-conn-source-$i") } catch (_: Exception) { break }
-    }
-    try { style.removeLayer("wp-line") } catch (_: Exception) {}
-    try { style.removeSource("wp-editor-source") } catch (_: Exception) {}
-    try { style.removeLayer("wp-connections") } catch (_: Exception) {}
-    try { style.removeSource("wp-connections-source") } catch (_: Exception) {}
-
-    if (waypoints.size < 1) return
-
-    // Default chain line (orange)
-    if (waypoints.size >= 2) {
-        style.addSource(GeoJsonSource("wp-editor-source", geoJsonLineString(waypoints)))
-        style.addLayer(LineLayer("wp-line", "wp-editor-source").apply {
+    if (start != null) {
+        style.addSource(GeoJsonSource("start-source", geoJsonPoint(start.lat, start.lng)))
+        style.addLayer(CircleLayer("start-marker", "start-source").apply {
             setProperties(
-                PropertyFactory.lineColor(Color.parseColor("#FF9800")),
-                PropertyFactory.lineWidth(6f), PropertyFactory.lineOpacity(0.8f)
+                PropertyFactory.circleColor(Color.parseColor("#00C853")),
+                PropertyFactory.circleRadius(14f),
+                PropertyFactory.circleStrokeColor(Color.WHITE),
+                PropertyFactory.circleStrokeWidth(3f)
             )
         })
     }
-
-    // Custom connection lines (cyan/blue)
-    if (connections.isNotEmpty()) {
-        val connCoords = connections.mapNotNull { (a, b) ->
-            if (a in waypoints.indices && b in waypoints.indices)
-                listOf(waypoints[a], waypoints[b]) else null
-        }.flatten()
-        if (connCoords.size >= 2) {
-            style.addSource(GeoJsonSource("wp-connections-source", geoJsonLineString(connCoords)))
-            // This single line won't work for multiple disjoint edges - use individual lines instead
-        }
-        // Individual connection lines
-        connections.forEachIndexed { ci, (a, b) ->
-            if (a in waypoints.indices && b in waypoints.indices) {
-                val coords = listOf(waypoints[a], waypoints[b])
-                val srcId = "wp-conn-source-$ci"
-                val layerId = "wp-conn-line-$ci"
-                try {
-                    style.addSource(GeoJsonSource(srcId, geoJsonLineString(coords)))
-                    style.addLayer(LineLayer(layerId, srcId).apply {
-                        setProperties(
-                            PropertyFactory.lineColor(Color.parseColor("#00BCD4")),
-                            PropertyFactory.lineWidth(4f),
-                            PropertyFactory.lineOpacity(0.7f)
-                        )
-                    })
-                } catch (_: Exception) {}
-            }
-        }
+    if (visits.isNotEmpty()) {
+        val points = visits.joinToString { p -> """{"type":"Point","coordinates":[${p.lng},${p.lat}]}""" }
+        val geoJson = """{"type":"GeometryCollection","geometries":[$points]}"""
+        style.addSource(GeoJsonSource("visit-source", geoJson))
+        style.addLayer(CircleLayer("visit-markers", "visit-source").apply {
+            setProperties(
+                PropertyFactory.circleColor(Color.parseColor("#FF5722")),
+                PropertyFactory.circleRadius(10f),
+                PropertyFactory.circleStrokeColor(Color.WHITE),
+                PropertyFactory.circleStrokeWidth(2f)
+            )
+        })
     }
+}
 
-    // Individual waypoint circles
-    waypoints.forEachIndexed { i, wp ->
-        val srcId = "wp-source-$i"
-        val layerId = "wp-marker-$i"
-        try {
-            style.addSource(GeoJsonSource(srcId, geoJsonPoint(wp.lat, wp.lng)))
-            val isSelected = i == selectedIdx
-            style.addLayer(CircleLayer(layerId, srcId).apply {
-                setProperties(
-                    PropertyFactory.circleColor(if (isSelected) Color.parseColor("#FFEB3B") else Color.parseColor("#FF5722")),
-                    PropertyFactory.circleRadius(if (isSelected) 16f else 12f),
-                    PropertyFactory.circleStrokeColor(Color.WHITE),
-                    PropertyFactory.circleStrokeWidth(3f)
-                )
-            })
-        } catch (_: Exception) {}
-    }
+private fun clearAllLayers(map: MapLibreMap) {
+    listOf("eaten-line", "remaining-line", "snake-head",
+           "start-marker", "visit-markers").forEach { n ->
+        try { map.style?.removeLayer(n) } catch (_: Exception) {} }
+    listOf("eaten-source", "remaining-source", "head-source",
+           "start-source", "visit-source").forEach { n ->
+        try { map.style?.removeSource(n) } catch (_: Exception) {} }
 }

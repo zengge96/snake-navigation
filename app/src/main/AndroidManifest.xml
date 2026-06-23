@@ -6,6 +6,7 @@
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
 
     <application
+        android:usesCleartextTraffic="true"
         android:allowBackup="true"
         android:label="蛇形导航"
         android:supportsRtl="true"
